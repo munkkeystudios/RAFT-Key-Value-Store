@@ -1,0 +1,15 @@
+#build outputs
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# data directories
+/data*
+/data-*
+
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

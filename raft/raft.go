@@ -21,8 +21,8 @@ import (
 	// "fmt"
 	"bytes"
 	"encoding/gob"
-	"labrpc"
 	"math/rand"
+	"net/rpc"
 	"sync"
 	"time"
 )
@@ -44,10 +44,11 @@ type Log struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct { //server related variables defined
-	mu        sync.Mutex
-	peers     []*labrpc.ClientEnd //list of other nodes in network
-	persister *Persister          //not needed rightnow
-	me        int                 // index into peers[]             //id for node right now
+	mu             sync.Mutex
+	peerAddrs      []string            // list of peer addresses (including self)
+	persister      *Persister          // persistence helper
+	me             int                 // index into peerAddrs
+	rpcClientCache map[int]*rpc.Client // cache of *rpc.Client per peer
 
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
@@ -153,24 +154,21 @@ type RequestVoteReply struct {
 }
 
 // example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if args.Term > rf.CurrentTerm {
-
 		rf.CurrentTerm = args.Term
 		rf.isLeader = false
-		rf.VotedFor = -1 //new term so reset votedfor
-		// rf.mu.Unlock()
+		rf.VotedFor = -1
 		go rf.persist()
-		// rf.mu.Lock()
 	}
 
 	reply.Term = rf.CurrentTerm
 	if args.Term < rf.CurrentTerm {
 		reply.VoteGranted = false
-		return //call sendRequest vote here?? or only when you are candidate?
+		return nil
 	}
 
 	lastLogIndex := len(rf.Log) - 1
@@ -180,16 +178,15 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidateId
 		rf.resetElectionTimer()
-
 	} else {
 		reply.VoteGranted = false
-
 	}
+	return nil
 
 }
 
 // example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
+// server is the index of the target server in rf.peerAddrs[].
 // expects RPC arguments in args.
 // fills in *reply with RPC reply, so caller should
 // pass &reply.
@@ -197,15 +194,37 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 // the same as the types of the arguments declared in the
 // handler function (including whether they are pointers).
 //
-// returns true if labrpc says the RPC was delivered.
+// returns true if the RPC was delivered (best-effort semantics over net/rpc).
 //
 // if you're having trouble getting RPC to work, check that you've
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool { // just need to call this to send RPC
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
+	// retry with small backoff and per-call timeout
+	backoff := 25 * time.Millisecond
+	for attempt := 0; attempt < 3; attempt++ {
+		addr := rf.peerAddrs[server]
+		client := rf.getOrDial(server, addr)
+		if client == nil {
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		callDone := make(chan error, 1)
+		go func() { callDone <- client.Call("Raft.RequestVote", args, reply) }()
+		select {
+		case err := <-callDone:
+			if err == nil { return true }
+			rf.mu.Lock(); delete(rf.rpcClientCache, server); rf.mu.Unlock()
+		case <-time.After(200 * time.Millisecond):
+			// timeout, evict and backoff
+			rf.mu.Lock(); delete(rf.rpcClientCache, server); rf.mu.Unlock()
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+	return false
 }
 
 type AppendEntriesArgs struct {
@@ -223,60 +242,75 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
-
-		return
+		return nil
 	}
-	if args.Term > rf.CurrentTerm { //step down if received from leader with higher term
-
+	if args.Term > rf.CurrentTerm { // step down
 		rf.CurrentTerm = args.Term
 		rf.isLeader = false
 		rf.VotedFor = -1 //new term so reset votedfor
 		go rf.persist()
 	}
-	//RESETLECTIONTIMER HERE
 	rf.resetElectionTimer()
 	reply.Term = rf.CurrentTerm
 
 	if len(args.Entries) == 0 {
 		if args.PrevLogIndex >= len(rf.Log) || rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Success = false
-			return
+			return nil
 		}
 		reply.Success = true
-		// return
 	}
 
 	if args.PrevLogIndex >= len(rf.Log) || rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
-		return
+		return nil
 	}
 	reply.Success = true
 
 	for i := 0; i < len(args.Entries); i++ { //deleting all entries further entries if conflict
 		if args.PrevLogIndex+1+i < len(rf.Log) && rf.Log[args.PrevLogIndex+1+i].Term != args.Entries[i].Term {
 			rf.Log = rf.Log[:args.PrevLogIndex+1+i]
-			// rf.persist() //krne ki zarorat?
 			break
 		}
 	}
-
-	rf.Log = append(rf.Log[:args.PrevLogIndex+1], args.Entries...) //copy all entries after previndx to own Log
+	rf.Log = append(rf.Log[:args.PrevLogIndex+1], args.Entries...)
 	go rf.persist()
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.Log)-1)
 	}
 	reply.Success = true
+	return nil
 }
 
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
+	backoff := 25 * time.Millisecond
+	for attempt := 0; attempt < 3; attempt++ {
+		addr := rf.peerAddrs[server]
+		client := rf.getOrDial(server, addr)
+		if client == nil {
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		callDone := make(chan error, 1)
+		go func() { callDone <- client.Call("Raft.AppendEntries", args, reply) }()
+		select {
+		case err := <-callDone:
+			if err == nil { return true }
+			rf.mu.Lock(); delete(rf.rpcClientCache, server); rf.mu.Unlock()
+		case <-time.After(200 * time.Millisecond):
+			rf.mu.Lock(); delete(rf.rpcClientCache, server); rf.mu.Unlock()
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+	}
+	return false
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -330,7 +364,7 @@ func (rf *Raft) heartbeatSender() {
 		rf.mu.Lock()
 		if rf.isLeader {
 			currentTerm := rf.CurrentTerm
-			for i := range rf.peers {
+			for i := range rf.peerAddrs {
 				if i != rf.me {
 					var entries []Log
 					if rf.nextIndex[i]-1 < len(rf.Log) {
@@ -363,12 +397,12 @@ func (rf *Raft) heartbeatSender() {
 
 								for N := len(rf.Log) - 1; N > rf.commitIndex; N-- {
 									count := 1
-									for j := range rf.peers {
+									for j := range rf.peerAddrs {
 										if j != rf.me && rf.matchIndex[j] >= N {
 											count++
 										}
 									}
-									if count > len(rf.peers)/2 && rf.Log[N].Term == rf.CurrentTerm {
+									if count > len(rf.peerAddrs)/2 && rf.Log[N].Term == rf.CurrentTerm {
 										rf.commitIndex = N
 										break
 									}
@@ -405,7 +439,7 @@ func (rf *Raft) heartbeatListener() {
 			rf.totalVotes = 1
 			rf.mu.Unlock()
 
-			for i := range rf.peers {
+			for i := range rf.peerAddrs {
 				if i != rf.me {
 					args := RequestVoteArgs{Term: rf.CurrentTerm, CandidateId: rf.me, LastLogIndex: len(rf.Log) - 1, LastLogTerm: rf.Log[len(rf.Log)-1].Term}
 					reply := RequestVoteReply{}
@@ -416,10 +450,10 @@ func (rf *Raft) heartbeatListener() {
 							if reply.VoteGranted {
 								rf.totalVotes++
 
-								if rf.totalVotes > len(rf.peers)/2 {
+								if rf.totalVotes > len(rf.peerAddrs)/2 {
 									rf.isLeader = true
 									lastLogIndex := len(rf.Log) - 1
-									for i := range rf.peers {
+									for i := range rf.peerAddrs {
 										rf.nextIndex[i] = lastLogIndex + 1
 										rf.matchIndex[i] = 0
 									}
@@ -484,15 +518,16 @@ func (rf *Raft) resetElectionTimer() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-func Make(peers []*labrpc.ClientEnd, me int,
+func Make(peers []string, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
-	rf.peers = peers
+	rf.peerAddrs = peers
 	rf.persister = persister
 	rf.me = me
 	rf.CurrentTerm = 0
 	rf.VotedFor = -1
 	rf.isLeader = false
+	rf.rpcClientCache = make(map[int]*rpc.Client)
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -502,7 +537,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.persist()
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-	for i := range rf.peers {
+	for i := range rf.peerAddrs {
 		rf.nextIndex[i] = 1
 		rf.matchIndex[i] = 0
 	}
@@ -518,4 +553,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+
+// getOrDial returns a cached *rpc.Client or attempts a new dial.
+// It does not hold the mutex while dialing to avoid blocking other operations.
+func (rf *Raft) getOrDial(server int, addr string) *rpc.Client {
+	rf.mu.Lock()
+	if c, ok := rf.rpcClientCache[server]; ok {
+		rf.mu.Unlock()
+		return c
+	}
+	rf.mu.Unlock()
+	c, err := rpc.Dial("tcp", addr)
+	if err != nil {
+		return nil
+	}
+	rf.mu.Lock()
+	rf.rpcClientCache[server] = c
+	rf.mu.Unlock()
+	return c
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
